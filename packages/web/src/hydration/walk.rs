@@ -207,6 +207,14 @@ impl WebsysDom {
             mounted_events: Vec::new(),
         };
         for anchor in element.dynamic_anchors() {
+            // `dynamic_anchors` also yields anchors that only hold dynamic
+            // child nodes of this element. Their id belongs to the slot (it
+            // is bound to the static sibling after it), not this element:
+            // taking it here binds the element under the wrong id and
+            // leaves its real one unbound, so removing it later fails.
+            if anchor.attrs().len() == 0 {
+                continue;
+            }
             let anchor_id = vnode
                 .mounted_anchor_node(anchor, dom)
                 .ok_or(VNodeNotInitialized)?;
