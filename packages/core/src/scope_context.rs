@@ -31,6 +31,11 @@ pub(crate) enum SuspenseLocation {
 }
 
 impl SuspenseLocation {
+    /// Whether this is a scope inside `boundary`'s fallback.
+    pub(crate) fn is_placeholder_of(&self, boundary: &SuspenseContext) -> bool {
+        matches!(self, SuspenseLocation::InSuspensePlaceholder(context) if context == boundary)
+    }
+
     pub(crate) fn suspense_context(&self) -> Option<&SuspenseContext> {
         match self {
             SuspenseLocation::InSuspensePlaceholder(context) => Some(context),

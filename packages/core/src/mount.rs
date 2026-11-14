@@ -255,9 +255,16 @@ impl VirtualDom {
         target_id: RenderTargetId,
     ) -> MountId {
         let mut mounts = self.runtime.mounts.borrow_mut();
+        // A mount made under a hidden one (in a suspense boundary's retained branch) is hidden
+        // with it, until the branch is promoted (`set_suspense_mounts_render_mode`).
+        let mode = logical_parent
+            .and_then(|parent| mounts.get(parent.0))
+            .map_or(RenderMode::Foreground, |parent| parent.mode);
         let entry = mounts.vacant_entry();
         let mount = MountId(entry.key());
-        entry.insert(Mount::new(node.clone(), logical_parent, target_id));
+        let mut created = Mount::new(node.clone(), logical_parent, target_id);
+        created.mode = mode;
+        entry.insert(created);
 
         mount
     }
@@ -639,8 +646,12 @@ impl VirtualDom {
         self.with_mount_mut(mount, |mount| mount.mode = mode);
     }
 
+    pub(crate) fn mount_mode(&self, mount: MountId) -> RenderMode {
+        self.with_mount(mount, |mount| mount.mode)
+    }
+
     pub(crate) fn mount_should_render(&self, mount: MountId) -> bool {
-        self.with_mount(mount, |mount| mount.mode == RenderMode::Foreground)
+        self.mount_mode(mount) == RenderMode::Foreground
     }
 
     /// Commit the new vnode for a mount after its roots/dynamic slots have been updated.

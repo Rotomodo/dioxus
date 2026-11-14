@@ -159,12 +159,17 @@ impl VirtualDom {
             .is_some_and(|order| self.dirty_scopes.remove(&order))
     }
 
-    /// Pop the highest-priority dirty scope below `ancestor`.
-    pub(crate) fn pop_dirty_descendant_scope(&mut self, ancestor: ScopeId) -> Option<ScopeOrder> {
+    /// Pop the highest-priority dirty scope below `ancestor` that `take` accepts, leaving the
+    /// others queued.
+    pub(crate) fn pop_dirty_descendant_scope(
+        &mut self,
+        ancestor: ScopeId,
+        take: impl Fn(ScopeId) -> bool,
+    ) -> Option<ScopeOrder> {
         let order = self
             .dirty_scopes
             .iter()
-            .find(|order| self.runtime.is_descendant_of(order.id, ancestor))
+            .find(|order| self.runtime.is_descendant_of(order.id, ancestor) && take(order.id))
             .copied()?;
         self.dirty_scopes.take(&order)
     }

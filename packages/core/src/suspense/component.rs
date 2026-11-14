@@ -5,7 +5,7 @@ use crate::{
     diff::context::DiffContext,
     diff::placement::{InsertionSite, insertion_site_at, splice_streamed_nodes},
     innerlude::*,
-    mount::{RenderMode, SuspenseBranch},
+    mount::{MountedParent, RenderMode, SuspenseBranch},
     render_driver::{RenderDriver, remove_rendered_output},
     scope_context::SuspenseLocation,
 };
@@ -404,7 +404,13 @@ impl RenderDriver for SuspenseDriver {
         _: Option<DiffContext<'_>>,
         to: Option<&mut (dyn WriteMutations + '_)>,
     ) {
-        let render_to = to.filter(|_| dom.scope_should_write_now(scope_id));
+        // A boundary's own suspense location says nothing of an outer boundary hiding it; its
+        // output's mount does (see `OutputPlace`).
+        let shown = dom.scopes[scope_id.index()]
+            .last_rendered_node
+            .as_ref()
+            .is_some_and(|output| dom.mount_should_render(output.root_mount()));
+        let render_to = to.filter(|_| shown && dom.scope_should_write_now(scope_id));
         suspense_diff(scope_id, dom, render_to)
     }
 
@@ -629,6 +635,10 @@ fn suspense_diff(
         let suspense_context = scope.state().suspense_boundary().unwrap().clone();
         let suspended_branch = suspense_context.suspended_branch();
         let suspended = !suspense_context.suspended_futures().is_empty();
+        // Where the visible output stands, for whatever replaces it. Its mode is also what the
+        // children get when they're promoted: a boundary inside another boundary's retained
+        // branch is hidden along with it.
+        let place = OutputPlace::of(dom, last_rendered_node.root_mount());
         match (suspended_branch, suspended) {
             // We already have suspended nodes that still need to be suspended
             // Just diff the normal and suspended nodes
@@ -663,6 +673,8 @@ fn suspense_diff(
                             );
                             (new_placeholder, placeholder_mount)
                         });
+                    // A fallback with a new template is a new mount.
+                    place.give_to(dom, placeholder_mount);
                     dom.scopes[scope_id.index()].last_rendered_node =
                         Some(MountedOutput::new(new_placeholder, placeholder_mount));
                     let branch = SuspenseBranch::new(new_suspended_nodes, new_suspended_mount);
@@ -676,7 +688,7 @@ fn suspense_diff(
                         dom,
                         &new_suspended_nodes,
                         new_suspended_mount,
-                        RenderMode::Foreground,
+                        place.mode,
                         false,
                     );
                     suspense_context.under_suspense_boundary(&dom.runtime(), || {
@@ -707,15 +719,12 @@ fn suspense_diff(
             }
             // We have no suspended nodes, and we are not suspended. Just diff the children like normal
             (None, false) => {
-                let old_render_parent = dom.mounted_render_parent(last_rendered_node.root_mount());
                 let new_mount = suspense_context.under_suspense_boundary(&dom.runtime(), || {
                     last_rendered_node
                         .mounted_vnode()
                         .diff_node(children.as_vnode(), dom, to)
                 });
-                if let Some(old_render_parent) = old_render_parent {
-                    dom.set_mounted_render_parent(new_mount, old_render_parent);
-                }
+                place.give_to(dom, new_mount);
 
                 set_rendered_children(dom, scope_id, children, new_mount);
             }
@@ -729,9 +738,7 @@ fn suspense_diff(
 
                 // Move the children to the background
                 let old_children_mount = old_children.root_mount();
-                let parent = dom
-                    .mounted_render_parent(old_children_mount)
-                    .map(|parent| parent.parent());
+                let parent = place.render_parent.map(|parent| parent.parent());
 
                 let placeholder_mount =
                     suspense_context.in_suspense_placeholder(&dom.runtime(), || {
@@ -744,6 +751,8 @@ fn suspense_diff(
                         );
                         created.mount
                     });
+                // The fallback now stands where the children were.
+                place.give_to(dom, placeholder_mount);
 
                 // Then diff the new children in the background
                 set_suspense_mounts_render_mode(
@@ -767,7 +776,7 @@ fn suspense_diff(
                         dom,
                         &new_children,
                         new_children_mount,
-                        RenderMode::Foreground,
+                        place.mode,
                         false,
                     );
                     suspense_context.under_suspense_boundary(&dom.runtime(), || {
@@ -819,7 +828,7 @@ fn suspense_diff(
                         dom,
                         children.as_vnode(),
                         new_children_mount,
-                        RenderMode::Foreground,
+                        place.mode,
                         true,
                     );
                     let mounted_children = dom
@@ -841,8 +850,22 @@ fn suspense_diff(
     })
 }
 
+/// Rerun the dirty scopes of the boundary's retained (background) branch, without a writer.
+///
+/// The boundary's own fallback scopes are on screen, not retained: they stay dirty for the render
+/// loop, which reruns them with the writer. Rerun here, their edits would never reach the
+/// renderer, since the fallback diff that follows skips its memoized components.
 fn flush_retained_branch_scopes(dom: &mut VirtualDom, scope_id: ScopeId) {
-    while let Some(order) = dom.pop_dirty_descendant_scope(scope_id) {
+    let runtime = dom.runtime.clone();
+    let Some(boundary) = runtime.get_state(scope_id).suspense_boundary() else {
+        return;
+    };
+    let retained = |scope: ScopeId| {
+        runtime
+            .try_get_state(scope)
+            .is_none_or(|scope| !scope.suspense_location().is_placeholder_of(&boundary))
+    };
+    while let Some(order) = dom.pop_dirty_descendant_scope(scope_id, retained) {
         let dirty_scope = order.id;
         let run_scope = dom
             .runtime
@@ -880,6 +903,39 @@ fn store_suspended_branch(dom: &mut VirtualDom, scope_id: ScopeId, branch: &Susp
         false,
     );
     store_suspense_children(dom, scope_id, &LastRenderedNode::Real(branch.root()));
+}
+
+/// Where a suspense boundary's visible output (its children or its fallback) stands: its render
+/// parent, and whether it's on screen.
+///
+/// Invariant: whatever the boundary shows is positioned by the boundary's own slot, so
+/// insertion-site resolution can climb out of it, and is on screen exactly when the boundary is.
+/// A mount created in place of the old output (a new fallback, or a fallback whose template
+/// changed) starts with neither: no render parent, and in the foreground. Left that way,
+/// [`replace_placeholder_with`] copies the missing parent onto the children when they come back,
+/// and the boundary's next fallback or children land at the renderer root; and a boundary hidden
+/// in another's retained branch writes its new fallback to the renderer.
+#[derive(Clone, Copy)]
+struct OutputPlace {
+    render_parent: Option<MountedParent>,
+    mode: RenderMode,
+}
+
+impl OutputPlace {
+    fn of(dom: &VirtualDom, mount: MountId) -> Self {
+        Self {
+            render_parent: dom.mounted_render_parent(mount),
+            mode: dom.mount_mode(mount),
+        }
+    }
+
+    /// Put `mount`, which now stands where the output was, in its place.
+    fn give_to(self, dom: &VirtualDom, mount: MountId) {
+        if let Some(render_parent) = self.render_parent {
+            dom.set_mounted_render_parent(mount, render_parent);
+        }
+        dom.set_mount_mode(mount, self.mode);
+    }
 }
 
 fn replace_placeholder_with(
